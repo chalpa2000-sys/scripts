@@ -1,0 +1,638 @@
+/***************
+ * Сквозная аналитика Cambo
+ * - Direct: выбираем источник (2 аккаунта) -> пишем в свой лист:
+ *      cambo  -> "Аналитика"
+ *      dubai  -> "Аналитика Dubai"
+ * - Amo: читаем сделки из Google Sheets (выгрузка уже есть)
+ * - Статусы: читаем матрицу из файла 1ia0m... лист "Статусы" (обновлённый)
+ * - Пишем ТОЛЬКО "сырые" колонки, формульные не трогаем
+ * - Фильтр: если clicks=0 И cost=0 => кампанию НЕ выводим (даже если есть сделки)
+ ***************/
+
+const CFG = {
+  // Где лежит матрица статусов (вы прислали этот файл)
+  STATUS_MATRIX_SPREADSHEET_ID: '1ia0mBwEIkhDqCAuVwo38X6rrO0utrGlTsFzbp_EurN4',
+  STATUS_SHEET_NAME: 'Статусы',
+
+  // Источники Direct + лист вывода под каждый источник
+  DIRECT_SOURCES: [
+    {
+      key: 'cambo',
+      label: 'Direct — Cambo (основной)',
+      spreadsheetId: '1NRmP_X4l6uds1PnHbtWPjxumGvQl3ihyiQG0Vkdnbo8',
+      sheetName: 'Данные из Директа',
+      costVatMultiplier: 1.0,
+      outSheetName: 'Аналитика',
+    },
+    {
+      key: 'dubai',
+      label: 'Direct — Cambo Dubai (новый аккаунт)',
+      spreadsheetId: '17GbZ1XeyGBjgeQiKLt5mwmDuIPyeU0aXkKuQXjRc5Ks',
+      sheetName: 'Данные из Директа',
+      costVatMultiplier: 1.0,
+      outSheetName: 'Аналитика Dubai',
+    }
+  ],
+
+  // Сделки Amo (таблица-выгрузка)
+  AMO_SPREADSHEET_ID: '1L7pIB33F2V7FQVt2FucKodsxPl7FTG5adIVIbob6OaI',
+  AMO_SHEET_NAME: 'Сделки Russian Deals',
+
+  // "Сырые" колонки, которые заполняем значениями (остальные — формулы, НЕ трогаем)
+  RAW_OUT_HEADERS: [
+    'Кампания',
+    'Клики',
+    'Расходы с НДС',
+    'Всего лидов',
+    'В работе',
+    'Живой',
+    'Квал',
+    'Отложенный',
+    'Сделки',
+    'Сумма сделок',
+    'Холодный',
+    'Передумал',
+    'Купили не у нас',
+    'Спам',
+    'Не отвечает'
+  ],
+
+  // Форс-правило: этот status_id всегда в "В работе"
+  FORCE_IN_WORK_STATUS_ID: '81326538',
+
+  TIMEZONE: Session.getScriptTimeZone()
+};
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Сквозная аналитика')
+    .addItem('Обновить Аналитику за период (календарь)', 'showDateSidebar')
+    .addSeparator()
+    .addItem('Самопроверка → прочитать “Статусы”', 'uiSelfCheckStatuses')
+    .addToUi();
+}
+
+function showDateSidebar() {
+  const html = HtmlService.createHtmlOutputFromFile('Sidebar')
+    .setTitle('Сквозная аналитика');
+  SpreadsheetApp.getUi().showSidebar(html);
+}
+
+function getDirectSources() {
+  return CFG.DIRECT_SOURCES.map((s, idx) => ({
+    idx: String(idx),
+    label: s.label,
+    outSheetName: s.outSheetName
+  }));
+}
+
+/**
+ * Entry from sidebar
+ * @param {string} fromIso 'YYYY-MM-DD'
+ * @param {string} toIso   'YYYY-MM-DD'
+ * @param {string} sourceIdxStr index of DIRECT_SOURCES
+ */
+function buildCampaignReportFromSidebar(fromIso, toIso, sourceIdxStr) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(fromIso || ''))) {
+    throw new Error('Неверный формат даты "С" (нужно YYYY-MM-DD)');
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(toIso || ''))) {
+    throw new Error('Неверный формат даты "ПО" (нужно YYYY-MM-DD)');
+  }
+
+  const fromDate = new Date(fromIso + 'T00:00:00');
+  const toDate = new Date(toIso + 'T23:59:59');
+  if (fromDate > toDate) throw new Error('Дата "С" не может быть больше даты "ПО".');
+
+  const sourceIdx = Number(sourceIdxStr || 0);
+  if (isNaN(sourceIdx) || sourceIdx < 0 || sourceIdx >= CFG.DIRECT_SOURCES.length) {
+    throw new Error('Некорректный источник Директа.');
+  }
+
+  const directSource = CFG.DIRECT_SOURCES[sourceIdx];
+  const outSheet = ensureOutputSheet_(directSource.outSheetName);
+
+  const res = buildCampaignReport_(fromDate, toDate, directSource);
+
+  return `Готово: ${res.rowsWritten} кампаний. Источник: ${directSource.label}. Записано в лист: "${outSheet.getName()}"`;
+}
+
+function buildCampaignReport_(fromDate, toDate, directSource) {
+  // 1) статусы (обновлённая матрица)
+  const statusSets = readStatusSets_();
+
+  // 2) direct agg
+  const directAgg = readDirectAgg_(directSource, fromDate, toDate); // Map(campaignId => {name, clicks, cost})
+
+  // 3) amo agg
+  const amoAgg = readAmoAgg_(fromDate, toDate, statusSets);         // Map(campaignId => {total, byCat, sumDeals})
+
+  // 4) union campaign ids
+  const allIdsObj = {};
+  directAgg.forEach((_, k) => { allIdsObj[String(k)] = true; });
+  amoAgg.forEach((_, k) => { allIdsObj[String(k)] = true; });
+  const allIds = Object.keys(allIdsObj);
+
+  // 5) build rows + hard filter clicks=0 && cost=0
+  const rows = [];
+  for (let i = 0; i < allIds.length; i++) {
+    const campaignId = allIds[i];
+
+    const d = directAgg.get(campaignId) || { name: String(campaignId), clicks: 0, cost: 0 };
+    const a = amoAgg.get(campaignId) || { total: 0, byCat: {}, sumDeals: 0 };
+
+    const clicks = Number(d.clicks || 0);
+    const cost = Number(d.cost || 0);
+
+    if (clicks === 0 && cost === 0) continue; // your rule
+
+    rows.push({
+      'Кампания': d.name || String(campaignId),
+      'Клики': clicks,
+      'Расходы с НДС': cost,
+      'Всего лидов': Number(a.total || 0),
+
+      // categories (names MUST match your "Аналитика" sheet headers)
+      'В работе': Number(a.byCat['В работе'] || 0),
+      'Живой': Number(a.byCat['Живой'] || 0),
+      'Квал': Number(a.byCat['Квал'] || 0),
+      'Отложенный': Number(a.byCat['Отложенный'] || 0),
+      'Сделки': Number(a.byCat['Сделки'] || 0),
+      'Сумма сделок': Number(a.sumDeals || 0),
+      'Холодный': Number(a.byCat['Холодный'] || 0),
+      'Передумал': Number(a.byCat['Передумал'] || 0),
+      'Купили не у нас': Number(a.byCat['Купили не у нас'] || 0),
+      'Спам': Number(a.byCat['Спам'] || 0),
+      'Не отвечает': Number(a.byCat['Не отвечает'] || 0),
+    });
+  }
+
+  // sort by cost desc
+  rows.sort((r1, r2) => Number(r2['Расходы с НДС'] || 0) - Number(r1['Расходы с НДС'] || 0));
+
+  // 6) write
+  const outSheet = ensureOutputSheet_(directSource.outSheetName);
+  writeToOutputRawOnly_(outSheet, rows);
+
+  return { rowsWritten: rows.length };
+}
+
+/**
+ * Ensure output sheet exists.
+ * If Dubai sheet missing -> copies "Аналитика" as template (with formulas).
+ */
+function ensureOutputSheet_(outSheetName) {
+  const ss = SpreadsheetApp.getActive();
+  let sh = ss.getSheetByName(outSheetName);
+  if (sh) return sh;
+
+  const base = ss.getSheetByName('Аналитика');
+  if (base) {
+    return base.copyTo(ss).setName(outSheetName);
+  }
+
+  return ss.insertSheet(outSheetName);
+}
+
+/**
+ * Read updated status matrix into:
+ *  category -> Set(keys)
+ * key examples:
+ *  "81363962"
+ *  "143/1690435"
+ *
+ * Matrix source:
+ * https://docs.google.com/spreadsheets/d/1ia0m.../gviz/tq?tqx=out:csv&sheet=Статусы
+ */
+function readStatusSets_() {
+  const ss = SpreadsheetApp.openById(CFG.STATUS_MATRIX_SPREADSHEET_ID);
+  const sheet = ss.getSheetByName(CFG.STATUS_SHEET_NAME);
+  if (!sheet) throw new Error(`Не найден лист "${CFG.STATUS_SHEET_NAME}" в файле матрицы статусов.`);
+
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+  if (lastRow < 1 || lastCol < 1) throw new Error('Матрица статусов пустая.');
+
+  const values = sheet.getRange(1, 1, lastRow, lastCol).getValues();
+  const headers = values[0].map(normText_);
+
+  // Будем учитывать только те категории, которые реально есть среди RAW_OUT_HEADERS
+  // (это защищает от "лишних" колонок в матрице)
+  const allowed = {};
+  CFG.RAW_OUT_HEADERS.forEach(h => { allowed[normText_(h)] = true; });
+
+  const setsByCat = new Map();
+  const cats = [];
+
+  // создаём Set для каждой категории из заголовков (кроме "Всего лидов")
+  for (let c = 0; c < headers.length; c++) {
+    const cat = normText_(headers[c]);
+    if (!cat) continue;
+    if (cat === 'Всего лидов') continue;
+    if (!allowed[cat]) continue;
+
+    if (!setsByCat.has(cat)) {
+      setsByCat.set(cat, new Set());
+      cats.push(cat);
+    }
+  }
+
+  // читаем ключи
+  for (let r = 1; r < values.length; r++) {
+    for (let c = 0; c < values[r].length; c++) {
+      const cat = normText_(headers[c]);
+      if (!cat || cat === 'Всего лидов') continue;
+      if (!setsByCat.has(cat)) continue;
+
+      const cell = values[r][c];
+      if (cell == null || cell === '') continue;
+
+      // может быть число или "143 / 1690435" или список через запятую
+      const tokens = String(cell).split(/[,;\n]/);
+      for (let t = 0; t < tokens.length; t++) {
+        const key = normalizeStatusKey_(tokens[t]);
+        if (key) setsByCat.get(cat).add(key);
+      }
+    }
+  }
+
+  // форс-правило
+  const inWork = 'В работе';
+  if (!setsByCat.has(inWork)) {
+    setsByCat.set(inWork, new Set());
+    cats.push(inWork);
+  }
+  setsByCat.get(inWork).add(String(CFG.FORCE_IN_WORK_STATUS_ID));
+
+  return { cats, setsByCat };
+}
+
+/** Direct: aggregate clicks/cost by CampaignId in date range */
+function readDirectAgg_(directSource, fromDate, toDate) {
+  const ss = SpreadsheetApp.openById(directSource.spreadsheetId);
+  const sheet = ss.getSheetByName(directSource.sheetName);
+  if (!sheet) throw new Error(`Direct: не найден лист "${directSource.sheetName}" в файле ${directSource.label}`);
+
+  const values = sheet.getDataRange().getValues();
+  if (!values || values.length < 2) return new Map();
+
+  const headerRowIdx = findHeaderRow_(values, ['Date', 'Дата']);
+  if (headerRowIdx < 0) throw new Error('Direct: не удалось найти строку заголовков (Date/Дата).');
+
+  const headers = values[headerRowIdx].map(normText_);
+  const hm = makeHeaderIndex_(headers);
+
+  const colDate = findCol_(hm, ['Date', 'Дата']);
+  const colId = findCol_(hm, ['CampaignId', 'ID кампании', 'Campaign ID']);
+  const colName = findCol_(hm, ['CampaignName', 'Название кампании', 'Campaign Name', 'Кампания']);
+  const colClicks = findCol_(hm, ['Clicks', 'Клики']);
+  const colCost = findCol_(hm, ['Cost', 'Расходы', 'Расходы с НДС', 'Spend']);
+
+  if ([colDate, colId, colName, colClicks, colCost].some(x => x < 0)) {
+    throw new Error('Direct: не найдены обязательные колонки (Date/CampaignId/CampaignName/Clicks/Cost).');
+  }
+
+  const out = new Map();
+  const from = startOfDay_(fromDate);
+  const to = endOfDay_(toDate);
+
+  for (let r = headerRowIdx + 1; r < values.length; r++) {
+    const row = values[r];
+    if (!row) continue;
+
+    const d = parseDateAny_(row[colDate]);
+    if (!d) continue;
+    if (d < from || d > to) continue;
+
+    const campaignId = normId_(row[colId]);
+    if (!campaignId) continue;
+
+    const name = normText_(row[colName]) || campaignId;
+    const clicks = toNumber_(row[colClicks]);
+    const cost = toNumber_(row[colCost]) * Number(directSource.costVatMultiplier || 1);
+
+    if (!out.has(campaignId)) out.set(campaignId, { name, clicks: 0, cost: 0 });
+    const obj = out.get(campaignId);
+    if (name) obj.name = name;
+    obj.clicks += clicks;
+    obj.cost += cost;
+  }
+
+  return out;
+}
+
+/** Amo: aggregate leads by campaign_id + categories from statusSets */
+function readAmoAgg_(fromDate, toDate, statusSets) {
+  const ss = SpreadsheetApp.openById(CFG.AMO_SPREADSHEET_ID);
+  const sheet = ss.getSheetByName(CFG.AMO_SHEET_NAME);
+  if (!sheet) throw new Error(`Amo: не найден лист "${CFG.AMO_SHEET_NAME}".`);
+
+  const values = sheet.getDataRange().getValues();
+  if (!values || values.length < 2) return new Map();
+
+  const headers = values[0].map(normText_);
+  const hm = makeHeaderIndex_(headers);
+
+  const colCreated = findCol_(hm, ['created_at', 'Created at', 'Дата создания']);
+  const colStatusId = findCol_(hm, ['status_id', 'Status ID']);
+  const colRejId = findCol_(hm, ['rejection_reason_id', 'rejection reason id']);
+  const colCampaignId = findCol_(hm, ['campaign_id', 'Campaign ID']);
+  const colPrice = findCol_(hm, ['price', 'Сумма', 'Amount', 'Цена']);
+
+  if (colCreated < 0 || colStatusId < 0 || colCampaignId < 0) {
+    throw new Error('Amo: не найдены обязательные колонки created_at/status_id/campaign_id.');
+  }
+
+  const out = new Map();
+  const from = startOfDay_(fromDate);
+  const to = endOfDay_(toDate);
+
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r];
+    if (!row) continue;
+
+    const d = parseDateAny_(row[colCreated]);
+    if (!d) continue;
+    if (d < from || d > to) continue;
+
+    const campaignId = normId_(row[colCampaignId]);
+    if (!campaignId) continue;
+
+    const statusId = normId_(row[colStatusId]);
+    const rejId = (colRejId >= 0) ? normId_(row[colRejId]) : '';
+    const statusKey = buildStatusKey_(statusId, rejId);
+    const price = (colPrice >= 0) ? toNumber_(row[colPrice]) : 0;
+
+    if (!out.has(campaignId)) out.set(campaignId, { total: 0, byCat: {}, sumDeals: 0 });
+    const obj = out.get(campaignId);
+    obj.total += 1;
+
+    // parallel count by categories
+    statusSets.cats.forEach(cat => {
+      const set = statusSets.setsByCat.get(cat);
+      if (!set) return;
+      if (set.has(statusKey) || (statusId && set.has(String(statusId)))) {
+        obj.byCat[cat] = Number(obj.byCat[cat] || 0) + 1;
+      }
+    });
+
+    // sumDeals only if in "Сделки"
+    const dealsSet = statusSets.setsByCat.get('Сделки');
+    if (dealsSet && (dealsSet.has(statusKey) || (statusId && dealsSet.has(String(statusId))))) {
+      obj.sumDeals += price;
+    }
+  }
+
+  return out;
+}
+
+/** Write only RAW_OUT_HEADERS into selected output sheet */
+function writeToOutputRawOnly_(sheet, rows) {
+  const headerMap = getHeaderMap_(sheet);
+
+  CFG.RAW_OUT_HEADERS.forEach(h => {
+    if (!headerMap.has(h)) throw new Error(`На листе "${sheet.getName()}" нет колонки: ${h}`);
+  });
+
+  const lastRow = Math.max(sheet.getLastRow(), 2);
+  const clearRows = Math.max(lastRow - 1, 1);
+
+  // clear only raw columns
+  CFG.RAW_OUT_HEADERS.forEach(h => {
+    const col = headerMap.get(h);
+    sheet.getRange(2, col, clearRows, 1).clearContent();
+  });
+
+  if (!rows || rows.length === 0) return;
+
+  // write per-column to avoid touching formulas
+  CFG.RAW_OUT_HEADERS.forEach(h => {
+    const col = headerMap.get(h);
+    const colVals = rows.map(r => [r[h] != null ? r[h] : '']);
+    sheet.getRange(2, col, colVals.length, 1).setValues(colVals);
+  });
+}
+
+/** ===== Helpers ===== */
+
+function normText_(v) {
+  return String(v == null ? '' : v)
+    .replace(/[\u00A0\u200B\uFEFF]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function normId_(v) {
+  const s = normText_(v);
+  if (!s) return '';
+  if (/^\d+(\.0+)?$/.test(s)) return String(parseInt(s, 10));
+  return s;
+}
+
+function normalizeStatusKey_(raw) {
+  const s0 = normText_(raw);
+  if (!s0) return '';
+  return s0.replace(/\s*\/\s*/g, '/');
+}
+
+function buildStatusKey_(statusId, rejectionReasonId) {
+  const s = normId_(statusId);
+  if (!s) return '';
+  if (String(s) === '143') {
+    const rr = normId_(rejectionReasonId);
+    return rr ? `143/${rr}` : '143';
+  }
+  return String(s);
+}
+
+function toNumber_(v) {
+  if (v == null || v === '') return 0;
+  if (typeof v === 'number') return isFinite(v) ? v : 0;
+  const s = String(v).replace(/\s/g, '').replace(',', '.');
+  const n = Number(s);
+  return isFinite(n) ? n : 0;
+}
+
+function parseDateAny_(v) {
+  if (v == null || v === '') return null;
+
+  if (Object.prototype.toString.call(v) === '[object Date]' && !isNaN(v.getTime())) {
+    return new Date(v.getFullYear(), v.getMonth(), v.getDate());
+  }
+
+  const s = normText_(v);
+
+  // ISO: YYYY-MM-DD
+  let m = s.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+
+  // RU: DD.MM.YYYY
+  m = s.match(/^(\d{2})\.(\d{2})\.(\d{4})/);
+  if (m) return new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1]));
+
+  // US: MM-DD-YYYY
+  m = s.match(/^(\d{2})-(\d{2})-(\d{4})/);
+  if (m) return new Date(Number(m[3]), Number(m[1]) - 1, Number(m[2]));
+
+  const t = Date.parse(s);
+  if (!isNaN(t)) {
+    const d = new Date(t);
+    return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  }
+
+  return null;
+}
+
+function startOfDay_(d) {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+}
+function endOfDay_(d) {
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate(), 23, 59, 59, 999);
+}
+
+function getHeaderMap_(sheet) {
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0].map(normText_);
+  const map = new Map();
+  headers.forEach((h, idx) => { if (h) map.set(h, idx + 1); });
+  return map;
+}
+
+function makeHeaderIndex_(headersArray) {
+  const m = {};
+  for (let i = 0; i < headersArray.length; i++) {
+    const key = normText_(headersArray[i]);
+    if (key) m[key] = i;
+  }
+  return m;
+}
+
+function findCol_(headerIndex, aliases) {
+  for (let i = 0; i < aliases.length; i++) {
+    const a = normText_(aliases[i]);
+    if (a in headerIndex) return headerIndex[a];
+  }
+  return -1;
+}
+
+function findHeaderRow_(values, mustHaveAnyOf) {
+  const limit = Math.min(values.length, 30);
+  for (let r = 0; r < limit; r++) {
+    const row = (values[r] || []).map(normText_);
+    for (let i = 0; i < mustHaveAnyOf.length; i++) {
+      const need = normText_(mustHaveAnyOf[i]);
+      if (row.indexOf(need) >= 0) return r;
+    }
+  }
+  return -1;
+}
+function uiSelfCheckStatuses() {
+  const ss = SpreadsheetApp.getActive();
+
+  // 1) Читаем то, что реально читает ваш основной расчёт
+  // (т.е. через readStatusSets_(), которая читает матрицу "Статусы")
+  const statusSets = readStatusSets_(); // { cats:[], setsByCat: Map(cat=>Set(keys)) }
+
+  // 2) Готовим лист диагностики
+  const DIAG_SHEET = 'Диагностика статусов';
+  const sh = ss.getSheetByName(DIAG_SHEET) || ss.insertSheet(DIAG_SHEET);
+  sh.clear();
+
+  const rows = [];
+  rows.push(['Самопроверка матрицы статусов', new Date()]);
+  rows.push(['Источник матрицы', `SpreadsheetId=${CFG.STATUS_MATRIX_SPREADSHEET_ID}`, `Sheet=${CFG.STATUS_SHEET_NAME}`]);
+  rows.push([]);
+
+  // Блок A: категории и количество ключей
+  rows.push(['Категория', 'Кол-во ключей в Set']);
+  statusSets.cats.forEach(cat => {
+    const set = statusSets.setsByCat.get(cat);
+    rows.push([cat, set ? set.size : 0]);
+  });
+
+  rows.push([]);
+
+  // Блок B: ключ -> категории (покажет, что 1 ключ может быть в нескольких колонках)
+  rows.push(['Ключ (status_id или 143/rejection_reason_id)', 'Категории', 'Сколько категорий']);
+  const keyToCats = new Map();
+
+  statusSets.cats.forEach(cat => {
+    const set = statusSets.setsByCat.get(cat);
+    if (!set) return;
+    set.forEach(key => {
+      if (!keyToCats.has(key)) keyToCats.set(key, []);
+      keyToCats.get(key).push(cat);
+    });
+  });
+
+  const keyEntries = Array.from(keyToCats.entries())
+    .sort((a, b) => (b[1].length - a[1].length) || String(a[0]).localeCompare(String(b[0])));
+
+  keyEntries.forEach(([key, cats]) => {
+    rows.push([key, cats.join(', '), cats.length]);
+  });
+
+  rows.push([]);
+
+  // Блок C: проверка, что колонки категорий существуют на листах вывода
+  rows.push(['Проверка заголовков на листах вывода']);
+  rows.push(['Лист вывода', 'Статус проверки']);
+  (CFG.DIRECT_SOURCES || []).forEach(src => {
+    const outName = src.outSheetName;
+    const outSh = ss.getSheetByName(outName);
+    if (!outSh) {
+      rows.push([outName, 'Лист не найден']);
+      return;
+    }
+    const headerMap = getHeaderMap_(outSh); // ваша функция из скрипта
+    const missing = statusSets.cats.filter(cat => !headerMap.has(cat));
+    rows.push([outName, missing.length ? ('Не хватает колонок: ' + missing.join(', ')) : 'OK']);
+  });
+
+  // 3) Запись на лист
+  const maxCols = Math.max(...rows.map(r => r.length));
+  const padded = rows.map(r => r.concat(Array(maxCols - r.length).fill('')));
+  sh.getRange(1, 1, padded.length, maxCols).setValues(padded);
+
+  // Небольшое оформление
+  sh.setFrozenRows(3);
+  sh.autoResizeColumns(1, maxCols);
+  sh.getRange(1, 1, 1, maxCols).setFontWeight('bold');
+
+  // Выделим строки, где ключ в >1 категории
+  // (это нормально при параллельном подсчёте, но полезно видеть)
+  const startRow = findRowStartsWith_(padded, 'Ключ (status_id или 143/rejection_reason_id)');
+  if (startRow > 0) {
+    // данные начинаются строкой ниже заголовка блока B
+    const dataStart = startRow + 1;
+    const dataRows = padded.length - dataStart + 1;
+    if (dataRows > 0) {
+      const range = sh.getRange(dataStart, 1, dataRows, maxCols);
+      const rules = sh.getConditionalFormatRules();
+
+      // Подсветка строк, где "Сколько категорий" > 1
+      const catCountCol = 3; // в блоке B это 3-я колонка
+      const formula = `=$C${dataStart}>1`;
+      rules.push(
+        SpreadsheetApp.newConditionalFormatRule()
+          .whenFormulaSatisfied(formula)
+          .setBackground('#FFF3CD') // светло-жёлтый
+          .setRanges([range])
+          .build()
+      );
+      sh.setConditionalFormatRules(rules);
+    }
+  }
+
+  SpreadsheetApp.getUi().alert(`Готово. Откройте лист "${DIAG_SHEET}".`);
+}
+
+// Вспомогательное: найти строку, где в A1 значение начинается с указанного текста
+function findRowStartsWith_(paddedRows, startsWithText) {
+  const t = String(startsWithText || '');
+  for (let i = 0; i < paddedRows.length; i++) {
+    const v = String(paddedRows[i][0] || '');
+    if (v === t) return i + 1; // 1-based
+  }
+  return -1;
+}
+
