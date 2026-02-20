@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <base target="_top" />
+    <style>
+      body { font-family: Arial, sans-serif; padding: 12px; }
+      label { display:block; margin-top: 10px; font-size: 12px; color:#333; }
+      input, select { width: 100%; box-sizing: border-box; padding: 8px; margin-top: 4px; }
+      button { width: 100%; margin-top: 12px; padding: 10px; }
+      .hint { margin-top: 10px; font-size: 12px; color: #666; line-height: 1.4; }
+      .msg { margin-top: 10px; font-size: 12px; padding: 8px; border-radius: 6px; display:none; }
+      .ok { background: #e8f5e9; color:#1b5e20; }
+      .err { background: #ffebee; color:#b71c1c; }
+      .small { font-size: 12px; color:#444; margin-top:6px; }
+    </style>
+  </head>
+  <body>
+    <h3>Период отчёта</h3>
+
+    <label>Источник Директа</label>
+    <select id="source"></select>
+    <div id="outSheet" class="small"></div>
+
+    <label>Дата С</label>
+    <input id="from" type="date" />
+
+    <label>Дата ПО</label>
+    <input id="to" type="date" />
+
+    <button onclick="run()">Обновить</button>
+
+    <div class="hint">
+      Кампания не выводится, если за период <b>Клики=0</b> и <b>Расходы=0</b>.<br/>
+      Матрица статусов читается из файла со статусами (лист <b>Статусы</b>).
+    </div>
+
+    <div id="msg" class="msg"></div>
+
+    <script>
+      let sources = [];
+
+      function toIso(d){
+        return d.getFullYear() + '-' +
+          String(d.getMonth()+1).padStart(2,'0') + '-' +
+          String(d.getDate()).padStart(2,'0');
+      }
+
+      function setMsg(text, isErr){
+        const el = document.getElementById('msg');
+        el.style.display = 'block';
+        el.className = 'msg ' + (isErr ? 'err' : 'ok');
+        el.textContent = text;
+      }
+
+      function initDates(){
+        const now = new Date();
+        document.getElementById('to').value = toIso(now);
+        const from = new Date(now.getTime() - 6*86400000);
+        document.getElementById('from').value = toIso(from);
+      }
+
+      function renderOutSheet(){
+        const idx = document.getElementById('source').value;
+        const s = sources.find(x => x.idx === idx);
+        document.getElementById('outSheet').textContent =
+          s ? ('Лист вывода: "' + s.outSheetName + '"') : '';
+      }
+
+      function initSources(){
+        google.script.run
+          .withSuccessHandler(function(list){
+            sources = list || [];
+            const sel = document.getElementById('source');
+            sel.innerHTML = '';
+            sources.forEach(function(item){
+              const opt = document.createElement('option');
+              opt.value = item.idx;
+              opt.textContent = item.label;
+              sel.appendChild(opt);
+            });
+            sel.addEventListener('change', renderOutSheet);
+            renderOutSheet();
+          })
+          .withFailureHandler(function(err){
+            setMsg('Не удалось получить список источников Директа: ' + (err.message || err), true);
+          })
+          .getDirectSources();
+      }
+
+      function run(){
+        const from = document.getElementById('from').value;
+        const to = document.getElementById('to').value;
+        const sourceIdx = document.getElementById('source').value;
+
+        if(!from || !to){
+          setMsg('Выберите обе даты.', true);
+          return;
+        }
+
+        setMsg('Запуск…', false);
+
+        google.script.run
+          .withSuccessHandler(function(res){ setMsg(res || 'Готово', false); })
+          .withFailureHandler(function(err){ setMsg(String(err.message || err), true); })
+          .buildCampaignReportFromSidebar(from, to, sourceIdx);
+      }
+
+      initDates();
+      initSources();
+    </script>
+  </body>
+</html>
