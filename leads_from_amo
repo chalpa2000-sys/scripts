@@ -1,0 +1,700 @@
+/********************
+ * amoCRM → Google Sheets (Russian Deals)
+ * Full backfill once + incremental sync every 5 minutes
+ * + Control cells (amo total / exported / OK-НЕ ОК)
+ * + Custom menu: Full export / Sync now
+ ********************/
+
+/************ SCRIPT PROPERTIES KEYS ************/
+const PROP_KEYS = {
+  SUBDOMAIN: 'AMO_SUBDOMAIN',
+
+  CLIENT_ID: 'AMO_CLIENT_ID',
+  CLIENT_SECRET: 'AMO_CLIENT_SECRET',
+  REDIRECT_URI: 'AMO_REDIRECT_URI',
+
+  ACCESS_TOKEN: 'AMO_ACCESS_TOKEN',
+  ACCESS_TOKEN_EXPIRES_AT: 'AMO_ACCESS_TOKEN_EXPIRES_AT', // unix sec
+  REFRESH_TOKEN: 'AMO_REFRESH_TOKEN',
+
+  SHEET_NAME: 'AMO_SHEET_NAME',
+
+  PIPELINE_NAME: 'AMO_PIPELINE_NAME',
+  PIPELINE_ID: 'AMO_PIPELINE_ID',
+
+  LAST_SYNC_TS: 'AMO_LAST_SYNC_TS',
+
+  REJECTION_REASON_FIELD_ID: 'AMO_REJECTION_REASON_FIELD_ID',
+
+  UTM_SOURCE_FIELD_ID: 'AMO_UTM_SOURCE_FIELD_ID',
+  UTM_CAMPAIGN_FIELD_ID: 'AMO_UTM_CAMPAIGN_FIELD_ID',
+  UTM_CONTENT_FIELD_ID: 'AMO_UTM_CONTENT_FIELD_ID',
+
+  YMUID_FIELD_ID: 'AMO_YMUID_FIELD_ID'
+};
+
+const LEADS_PAGE_LIMIT = 250;
+const SYNC_LOCK_WAIT_MS = 30 * 1000;
+const OVERLAP_SECONDS = 120;
+
+const DEFAULT_PIPELINE_NAME = 'Russian Deals';
+const DEFAULT_SHEET_NAME = 'Сделки Russian Deals';
+const DEFAULT_REJECTION_REASON_FIELD_ID = 2086611;
+
+// Ваши UTM field_id
+const DEFAULT_UTM_SOURCE_FIELD_ID = 1973361;
+const DEFAULT_UTM_CAMPAIGN_FIELD_ID = 1973359;
+const DEFAULT_UTM_CONTENT_FIELD_ID = 1973355;
+
+// НОВОЕ: ymuid field_id
+const DEFAULT_YMUID_FIELD_ID = 1973383;
+
+/** V1 (старое): без campaign_id/group_id/ymuid */
+const DATA_HEADER_V1 = [
+  'deal_id',
+  'deal',
+  'status',
+  'status_id',
+  'rejection_reason',
+  'rejection_reason_id',
+  'price',
+  'created_at',
+  'updated_at',
+  'utm_source',
+  'utm_campaign',
+  'utm_content'
+];
+
+/** V2: + campaign_id, group_id */
+const DATA_HEADER_V2 = [
+  ...DATA_HEADER_V1,
+  'campaign_id',
+  'group_id'
+];
+
+/** V3: + ymuid (в конец, после group_id) */
+const DATA_HEADER_V3 = [
+  ...DATA_HEADER_V2,
+  'ymuid'
+];
+
+/** 1-based индексы колонок ДАННЫХ */
+const COL = {
+  deal_id: 1,
+  deal: 2,
+  status: 3,
+  status_id: 4,
+  rejection_reason: 5,
+  rejection_reason_id: 6,
+  price: 7,
+  created_at: 8,     // H
+  updated_at: 9,     // I
+  utm_source: 10,    // J
+  utm_campaign: 11,  // K
+  utm_content: 12,   // L
+  campaign_id: 13,   // M
+  group_id: 14,      // N
+  ymuid: 15          // O
+};
+
+/************ GOOGLE SHEETS MENU ************/
+function onOpen(e) {
+  SpreadsheetApp.getUi()
+    .createMenu('amoCRM')
+    .addItem('Синхронизация сейчас', 'menuSyncNow_')
+    .addSeparator()
+    .addItem('Полная выгрузка', 'menuFullExport_')
+    .addToUi();
+}
+
+function menuSyncNow_() {
+  syncAmoDeals();
+}
+
+function menuFullExport_() {
+  const ui = SpreadsheetApp.getUi();
+  const resp = ui.alert(
+    'Полная выгрузка',
+    'Полная выгрузка очистит данные на листе и загрузит все сделки заново. Продолжить?',
+    ui.ButtonSet.YES_NO
+  );
+  if (resp !== ui.Button.YES) return;
+
+  initialFullExportAllTime();
+}
+
+/************ (A) ONE-TIME CONFIG ************/
+function setAmoConfig() {
+  const props = PropertiesService.getScriptProperties();
+
+  props.setProperty(PROP_KEYS.SHEET_NAME, DEFAULT_SHEET_NAME);
+  props.setProperty(PROP_KEYS.PIPELINE_NAME, DEFAULT_PIPELINE_NAME);
+  props.setProperty(PROP_KEYS.REJECTION_REASON_FIELD_ID, String(DEFAULT_REJECTION_REASON_FIELD_ID));
+
+  if (!props.getProperty(PROP_KEYS.UTM_SOURCE_FIELD_ID)) props.setProperty(PROP_KEYS.UTM_SOURCE_FIELD_ID, String(DEFAULT_UTM_SOURCE_FIELD_ID));
+  if (!props.getProperty(PROP_KEYS.UTM_CAMPAIGN_FIELD_ID)) props.setProperty(PROP_KEYS.UTM_CAMPAIGN_FIELD_ID, String(DEFAULT_UTM_CAMPAIGN_FIELD_ID));
+  if (!props.getProperty(PROP_KEYS.UTM_CONTENT_FIELD_ID)) props.setProperty(PROP_KEYS.UTM_CONTENT_FIELD_ID, String(DEFAULT_UTM_CONTENT_FIELD_ID));
+
+  if (!props.getProperty(PROP_KEYS.YMUID_FIELD_ID)) props.setProperty(PROP_KEYS.YMUID_FIELD_ID, String(DEFAULT_YMUID_FIELD_ID));
+
+  props.deleteProperty(PROP_KEYS.PIPELINE_ID);
+}
+
+/************ (B) INITIAL FULL EXPORT (ONCE) ************/
+function initialFullExportAllTime() {
+  const props = PropertiesService.getScriptProperties();
+
+  const sheet = getOrCreateSheet_();
+  ensureStructureOrMigrate_(sheet);
+
+  clearSheetDataKeepHeader_(sheet);
+
+  props.setProperty(PROP_KEYS.LAST_SYNC_TS, '0');
+
+  syncAmoDeals();
+}
+
+/************ (C) INCREMENTAL SYNC ************/
+function syncAmoDeals() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(SYNC_LOCK_WAIT_MS)) {
+    throw new Error('Не удалось получить lock: синхронизация уже выполняется');
+  }
+
+  try {
+    const props = PropertiesService.getScriptProperties();
+    const sheet = getOrCreateSheet_();
+    ensureStructureOrMigrate_(sheet);
+
+    const pipelineId = getPipelineIdByNameOrThrow_();
+    const statusMap = getStatusMapOnlyStatusName_();
+
+    const lastSync = Number(props.getProperty(PROP_KEYS.LAST_SYNC_TS) || 0);
+    const fromTs = Math.max(0, lastSync - OVERLAP_SECONDS);
+
+    const rejectionFieldId = Number(props.getProperty(PROP_KEYS.REJECTION_REASON_FIELD_ID) || DEFAULT_REJECTION_REASON_FIELD_ID);
+
+    const utmSourceFieldId = Number(props.getProperty(PROP_KEYS.UTM_SOURCE_FIELD_ID) || DEFAULT_UTM_SOURCE_FIELD_ID);
+    const utmCampaignFieldId = Number(props.getProperty(PROP_KEYS.UTM_CAMPAIGN_FIELD_ID) || DEFAULT_UTM_CAMPAIGN_FIELD_ID);
+    const utmContentFieldId = Number(props.getProperty(PROP_KEYS.UTM_CONTENT_FIELD_ID) || DEFAULT_UTM_CONTENT_FIELD_ID);
+
+    const ymuidFieldId = Number(props.getProperty(PROP_KEYS.YMUID_FIELD_ID) || DEFAULT_YMUID_FIELD_ID);
+
+    const existingRowById = buildExistingRowIndex_(sheet);
+
+    let page = 1;
+    let maxUpdatedAt = lastSync;
+
+    const rowsToAppend = [];
+
+    while (true) {
+      const params = {
+        limit: LEADS_PAGE_LIMIT,
+        page: page,
+        'order[updated_at]': 'asc',
+        'filter[updated_at][from]': fromTs,
+        'filter[pipeline_id][0]': pipelineId
+      };
+
+      const data = amoApiGet_('/api/v4/leads', params);
+      const leads = (((data || {})._embedded || {}).leads) || [];
+      if (!leads.length) break;
+
+      for (const lead of leads) {
+        const dealId = lead.id;
+
+        const updatedAtSec = Number(lead.updated_at || 0);
+        if (updatedAtSec > maxUpdatedAt) maxUpdatedAt = updatedAtSec;
+
+        const subdomain = props.getProperty(PROP_KEYS.SUBDOMAIN);
+        const dealUrl = `https://${subdomain}.amocrm.ru/leads/detail/${dealId}`;
+
+        const dealName = lead.name || String(dealId);
+        const dealRich = buildRichLink_(dealName, dealUrl);
+
+        const statusId = lead.status_id;
+        const statusName = statusMap[String(statusId)] || String(statusId);
+
+        const rr = getCustomFieldValueWithEnumId_(lead.custom_fields_values || [], rejectionFieldId);
+        const rejectionReason = rr.value;
+        const rejectionReasonId = rr.enum_id;
+
+        const price = (lead.price != null) ? lead.price : '';
+        const createdAtDate = unixSecToDate_(lead.created_at);
+        const updatedAtDate = unixSecToDate_(lead.updated_at);
+
+        const cfv = lead.custom_fields_values || [];
+        const utmSource = getCustomFieldValue_(cfv, utmSourceFieldId);
+        const utmCampaign = getCustomFieldValue_(cfv, utmCampaignFieldId);
+        const utmContent = getCustomFieldValue_(cfv, utmContentFieldId);
+
+        const campaignId = extractCampaignId_(utmCampaign);
+        const groupId = extractGroupId_(utmContent);
+
+        // НОВОЕ: ymuid
+        const ymuid = getCustomFieldValue_(cfv, ymuidFieldId);
+
+        const rowNum = existingRowById[String(dealId)];
+
+        if (rowNum) {
+          sheet.getRange(rowNum, COL.deal).setRichTextValue(dealRich);
+
+          sheet.getRange(rowNum, COL.status).setValue(statusName);
+          sheet.getRange(rowNum, COL.status_id).setValue(statusId);
+
+          sheet.getRange(rowNum, COL.rejection_reason).setValue(rejectionReason);
+          sheet.getRange(rowNum, COL.rejection_reason_id).setValue(rejectionReasonId);
+
+          sheet.getRange(rowNum, COL.price).setValue(price);
+          sheet.getRange(rowNum, COL.created_at).setValue(createdAtDate);
+          sheet.getRange(rowNum, COL.updated_at).setValue(updatedAtDate);
+
+          sheet.getRange(rowNum, COL.utm_source).setValue(utmSource);
+          sheet.getRange(rowNum, COL.utm_campaign).setValue(utmCampaign);
+          sheet.getRange(rowNum, COL.utm_content).setValue(utmContent);
+
+          sheet.getRange(rowNum, COL.campaign_id).setValue(campaignId);
+          sheet.getRange(rowNum, COL.group_id).setValue(groupId);
+
+          sheet.getRange(rowNum, COL.ymuid).setValue(ymuid);
+        } else {
+          rowsToAppend.push([
+            dealId,
+            dealName,
+            statusName,
+            statusId,
+            rejectionReason,
+            rejectionReasonId,
+            price,
+            createdAtDate,
+            updatedAtDate,
+            utmSource,
+            utmCampaign,
+            utmContent,
+            campaignId,
+            groupId,
+            ymuid
+          ]);
+        }
+      }
+
+      if (leads.length < LEADS_PAGE_LIMIT) break;
+      page++;
+    }
+
+    if (rowsToAppend.length) {
+      const startRow = sheet.getLastRow() + 1;
+      sheet.getRange(startRow, 1, rowsToAppend.length, DATA_HEADER_V3.length).setValues(rowsToAppend);
+
+      for (let i = 0; i < rowsToAppend.length; i++) {
+        const dealId = rowsToAppend[i][0];
+        const dealName = rowsToAppend[i][1];
+
+        const subdomain = props.getProperty(PROP_KEYS.SUBDOMAIN);
+        const dealUrl = `https://${subdomain}.amocrm.ru/leads/detail/${dealId}`;
+
+        sheet.getRange(startRow + i, COL.deal).setRichTextValue(buildRichLink_(dealName, dealUrl));
+      }
+    }
+
+    sheet.getRange(2, COL.created_at, Math.max(1, sheet.getMaxRows() - 1), 1)
+      .setNumberFormat('dd.MM.yyyy HH:mm:ss');
+    sheet.getRange(2, COL.updated_at, Math.max(1, sheet.getMaxRows() - 1), 1)
+      .setNumberFormat('dd.MM.yyyy HH:mm:ss');
+
+    normalizeUnixToDatesInColumn_(sheet, COL.created_at);
+    normalizeUnixToDatesInColumn_(sheet, COL.updated_at);
+
+    props.setProperty(PROP_KEYS.LAST_SYNC_TS, String(maxUpdatedAt));
+
+    // ---- КОНТРОЛЬ ----
+    const amoTotal = countAmoLeadsInPipelineByPaging_(pipelineId);
+    const exportedTotal = getSheetUniqueDealsCount_(sheet);
+    updateControlCells_(sheet, amoTotal, exportedTotal);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/************ (D) TRIGGER: EVERY 5 MINUTES ************/
+function installSyncTriggerEvery5Minutes() {
+  removeSyncTriggers_();
+  ScriptApp.newTrigger('syncAmoDeals').timeBased().everyMinutes(5).create();
+}
+
+function removeSyncTriggers_() {
+  const triggers = ScriptApp.getProjectTriggers();
+  for (const t of triggers) {
+    if (t.getHandlerFunction() === 'syncAmoDeals') ScriptApp.deleteTrigger(t);
+  }
+}
+
+/************ CONTROL ************/
+function updateControlCells_(sheet, amoTotal, exportedTotal) {
+  const controlStartCol = DATA_HEADER_V3.length + 1;
+
+  sheet.getRange(1, controlStartCol).setValue('amo_total');
+  sheet.getRange(1, controlStartCol + 1).setValue('exported_total');
+  sheet.getRange(1, controlStartCol + 2).setValue('control');
+
+  sheet.getRange(2, controlStartCol).setValue(amoTotal);
+  sheet.getRange(2, controlStartCol + 1).setValue(exportedTotal);
+
+  const ok = Number(amoTotal) === Number(exportedTotal);
+  const statusCell = sheet.getRange(2, controlStartCol + 2);
+
+  if (ok) {
+    statusCell.setValue('ОК');
+    statusCell.setBackground('#1B5E20');
+    statusCell.setFontColor('#FFFFFF');
+  } else {
+    statusCell.setValue('НЕ ОК');
+    statusCell.setBackground('#B71C1C');
+    statusCell.setFontColor('#FFFFFF');
+  }
+
+  sheet.getRange(1, controlStartCol, 2, 3).setHorizontalAlignment('center');
+  sheet.getRange(1, controlStartCol, 1, 3).setFontWeight('bold');
+}
+
+function getSheetUniqueDealsCount_(sheet) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return 0;
+
+  const ids = sheet.getRange(2, COL.deal_id, lastRow - 1, 1).getValues();
+  const set = new Set();
+  for (const r of ids) {
+    const v = r[0];
+    if (v !== '' && v != null) set.add(String(v));
+  }
+  return set.size;
+}
+
+function countAmoLeadsInPipelineByPaging_(pipelineId) {
+  let page = 1;
+  let total = 0;
+
+  while (true) {
+    const data = amoApiGet_('/api/v4/leads', {
+      limit: LEADS_PAGE_LIMIT,
+      page: page,
+      'filter[pipeline_id][0]': pipelineId
+    });
+
+    const leads = (((data || {})._embedded || {}).leads) || [];
+    if (!leads.length) break;
+
+    total += leads.length;
+
+    if (leads.length < LEADS_PAGE_LIMIT) break;
+    page++;
+  }
+
+  return total;
+}
+
+/************ SHEET HELPERS ************/
+function getOrCreateSheet_() {
+  const ss = SpreadsheetApp.getActive();
+  const props = PropertiesService.getScriptProperties();
+  const name = props.getProperty(PROP_KEYS.SHEET_NAME) || DEFAULT_SHEET_NAME;
+
+  let sh = ss.getSheetByName(name);
+  if (!sh) sh = ss.insertSheet(name);
+  return sh;
+}
+
+/**
+ * Миграция:
+ * - пустой лист → ставим V3
+ * - V1 → вставляем 3 колонки после utm_content (campaign_id, group_id, ymuid) и ставим V3
+ * - V2 → вставляем 1 колонку после group_id (ymuid) и ставим V3
+ */
+function ensureStructureOrMigrate_(sheet) {
+  const lastCol = Math.max(sheet.getLastColumn(), DATA_HEADER_V3.length + 3);
+  const row1 = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(v => String(v || '').trim());
+
+  const isEmpty = row1.slice(0, DATA_HEADER_V1.length).every(x => !x);
+  if (isEmpty) {
+    sheet.getRange(1, 1, 1, DATA_HEADER_V3.length).setValues([DATA_HEADER_V3]);
+    sheet.setFrozenRows(1);
+    return;
+  }
+
+  if (matchesHeaderPrefix_(row1, DATA_HEADER_V3)) return;
+
+  if (matchesHeaderPrefix_(row1, DATA_HEADER_V2)) {
+    // вставляем ymuid после group_id (group_id = 14-я колонка данных)
+    sheet.insertColumnAfter(14);
+    sheet.getRange(1, 1, 1, DATA_HEADER_V3.length).setValues([DATA_HEADER_V3]);
+    sheet.setFrozenRows(1);
+    return;
+  }
+
+  if (matchesHeaderPrefix_(row1, DATA_HEADER_V1)) {
+    // вставляем campaign_id, group_id, ymuid после utm_content (12)
+    sheet.insertColumnsAfter(12, 3);
+    sheet.getRange(1, 1, 1, DATA_HEADER_V3.length).setValues([DATA_HEADER_V3]);
+    sheet.setFrozenRows(1);
+    return;
+  }
+
+  throw new Error(
+    `Лист "${sheet.getName()}" имеет неожидаемую шапку. ` +
+    `Решение: создайте новый лист или очистите 1-ю строку и запустите "Полная выгрузка".`
+  );
+}
+
+function matchesHeaderPrefix_(row1, header) {
+  for (let i = 0; i < header.length; i++) {
+    if (String(row1[i] || '').trim() !== header[i]) return false;
+  }
+  return true;
+}
+
+function clearSheetDataKeepHeader_(sheet) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return;
+  sheet.getRange(2, 1, lastRow - 1, sheet.getLastColumn()).clearContent();
+}
+
+function buildExistingRowIndex_(sheet) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return {};
+
+  const ids = sheet.getRange(2, COL.deal_id, lastRow - 1, 1).getValues();
+  const map = {};
+  for (let i = 0; i < ids.length; i++) {
+    const id = ids[i][0];
+    if (id !== '' && id != null) map[String(id)] = i + 2;
+  }
+  return map;
+}
+
+function buildRichLink_(text, url) {
+  const t = String(text || '').replace(/\r?\n/g, ' ');
+  return SpreadsheetApp.newRichTextValue().setText(t).setLinkUrl(url).build();
+}
+
+/************ PARSERS ************/
+function extractCampaignId_(utmCampaign) {
+  const s = String(utmCampaign || '').trim();
+  if (!s) return '';
+  const m = s.match(/_([0-9]+)\s*$/);
+  return m ? m[1] : '';
+}
+
+function extractGroupId_(utmContent) {
+  const s = String(utmContent || '').trim();
+  if (!s) return '';
+  const m = s.match(/gbid:(\d+)(?:\||$)/i);
+  return m ? m[1] : '';
+}
+
+/************ TIME HELPERS ************/
+function unixSecToDate_(unixSec) {
+  const n = Number(unixSec);
+  return n ? new Date(n * 1000) : '';
+}
+
+function normalizeUnixToDatesInColumn_(sheet, colIndex) {
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) return;
+
+  const range = sheet.getRange(2, colIndex, lastRow - 1, 1);
+  const values = range.getValues();
+  let changed = false;
+
+  for (let i = 0; i < values.length; i++) {
+    const v = values[i][0];
+    if (v instanceof Date) continue;
+
+    const n = Number(v);
+    if (!Number.isFinite(n) || n <= 0) continue;
+
+    if (n > 1000000000 && n < 1000000000000) {
+      values[i][0] = new Date(n * 1000);
+      changed = true;
+      continue;
+    }
+
+    if (n >= 1000000000000 && n < 10000000000000) {
+      values[i][0] = new Date(n);
+      changed = true;
+      continue;
+    }
+  }
+
+  if (changed) range.setValues(values);
+}
+
+/************ PIPELINE + STATUS MAP ************/
+function getPipelineIdByNameOrThrow_() {
+  const props = PropertiesService.getScriptProperties();
+
+  const cached = Number(props.getProperty(PROP_KEYS.PIPELINE_ID) || 0);
+  if (cached) return cached;
+
+  const pipelineName = String(props.getProperty(PROP_KEYS.PIPELINE_NAME) || DEFAULT_PIPELINE_NAME).trim();
+  if (!pipelineName) throw new Error('Не задано AMO_PIPELINE_NAME');
+
+  const data = amoApiGet_('/api/v4/leads/pipelines', { limit: 250, page: 1 });
+  const pipelines = (((data || {})._embedded || {}).pipelines) || [];
+
+  const found = pipelines.find(p => String(p.name || '').trim() === pipelineName);
+  if (!found) {
+    const names = pipelines.map(p => p.name).filter(Boolean).join(', ');
+    throw new Error(`Воронка "${pipelineName}" не найдена. Доступные: ${names}`);
+  }
+
+  props.setProperty(PROP_KEYS.PIPELINE_ID, String(found.id));
+  return Number(found.id);
+}
+
+function getStatusMapOnlyStatusName_() {
+  const cache = CacheService.getScriptCache();
+  const cached = cache.get('AMO_STATUS_MAP_ONLY_NAME');
+  if (cached) return JSON.parse(cached);
+
+  const data = amoApiGet_('/api/v4/leads/pipelines', { limit: 250, page: 1 });
+  const pipelines = (((data || {})._embedded || {}).pipelines) || [];
+
+  const map = {};
+  for (const p of pipelines) {
+    const statuses = ((p._embedded || {}).statuses) || [];
+    for (const st of statuses) {
+      map[String(st.id)] = st.name;
+    }
+  }
+
+  cache.put('AMO_STATUS_MAP_ONLY_NAME', JSON.stringify(map), 6 * 3600);
+  return map;
+}
+
+/************ CUSTOM FIELDS ************/
+function getCustomFieldValue_(customFieldsValues, fieldId) {
+  if (!fieldId) return '';
+  const item = (customFieldsValues || []).find(x => Number(x.field_id) === Number(fieldId));
+  if (!item || !item.values || !item.values.length) return '';
+  const v = item.values[0];
+  return (v && v.value != null) ? String(v.value) : '';
+}
+
+function getCustomFieldValueWithEnumId_(customFieldsValues, fieldId) {
+  if (!fieldId) return { value: '', enum_id: '' };
+
+  const item = (customFieldsValues || []).find(x => Number(x.field_id) === Number(fieldId));
+  if (!item || !item.values || !item.values.length) return { value: '', enum_id: '' };
+
+  const v = item.values[0] || {};
+  return {
+    value: (v.value != null) ? String(v.value) : '',
+    enum_id: (v.enum_id != null) ? String(v.enum_id) : ''
+  };
+}
+
+/************ AMO API + OAUTH ************/
+function amoApiGet_(path, queryParams) {
+  const url = buildAmoUrl_(path, queryParams);
+  return amoFetchJson_(url, 'get');
+}
+
+function amoFetchJson_(url, method) {
+  const maxAttempts = 6;
+  let attempt = 0;
+
+  while (true) {
+    attempt++;
+
+    const token = getValidAccessToken_();
+    const resp = UrlFetchApp.fetch(url, {
+      method,
+      muteHttpExceptions: true,
+      headers: { Authorization: 'Bearer ' + token }
+    });
+
+    const code = resp.getResponseCode();
+
+    if (code === 401) {
+      refreshAccessToken_();
+      if (attempt >= maxAttempts) return parseJsonOrThrow_(resp);
+      continue;
+    }
+
+    if (code === 429 || (code >= 500 && code <= 599)) {
+      if (attempt >= maxAttempts) return parseJsonOrThrow_(resp);
+      const sleepMs = Math.min(30000, 1000 * Math.pow(2, attempt - 1));
+      Utilities.sleep(sleepMs);
+      continue;
+    }
+
+    return parseJsonOrThrow_(resp);
+  }
+}
+
+function parseJsonOrThrow_(resp) {
+  const code = resp.getResponseCode();
+  const text = resp.getContentText();
+  if (code >= 200 && code < 300) return text ? JSON.parse(text) : {};
+  throw new Error(`amoCRM API error ${code}: ${text}`);
+}
+
+function getValidAccessToken_() {
+  const props = PropertiesService.getScriptProperties();
+  const token = props.getProperty(PROP_KEYS.ACCESS_TOKEN);
+  const expAt = Number(props.getProperty(PROP_KEYS.ACCESS_TOKEN_EXPIRES_AT) || 0);
+  const nowSec = Math.floor(Date.now() / 1000);
+
+  if (!token || !expAt || nowSec >= (expAt - 60)) {
+    return refreshAccessToken_();
+  }
+  return token;
+}
+
+function refreshAccessToken_() {
+  const props = PropertiesService.getScriptProperties();
+  const subdomain = props.getProperty(PROP_KEYS.SUBDOMAIN);
+
+  const url = `https://${subdomain}.amocrm.ru/oauth2/access_token`;
+  const payload = {
+    client_id: props.getProperty(PROP_KEYS.CLIENT_ID),
+    client_secret: props.getProperty(PROP_KEYS.CLIENT_SECRET),
+    grant_type: 'refresh_token',
+    refresh_token: props.getProperty(PROP_KEYS.REFRESH_TOKEN),
+    redirect_uri: props.getProperty(PROP_KEYS.REDIRECT_URI)
+  };
+
+  const resp = UrlFetchApp.fetch(url, {
+    method: 'post',
+    contentType: 'application/json',
+    muteHttpExceptions: true,
+    payload: JSON.stringify(payload)
+  });
+
+  if (resp.getResponseCode() < 200 || resp.getResponseCode() >= 300) {
+    throw new Error(`Token refresh failed: ${resp.getResponseCode()} ${resp.getContentText()}`);
+  }
+
+  const data = JSON.parse(resp.getContentText());
+  const nowSec = Math.floor(Date.now() / 1000);
+
+  props.setProperty(PROP_KEYS.ACCESS_TOKEN, data.access_token);
+  props.setProperty(PROP_KEYS.REFRESH_TOKEN, data.refresh_token);
+  props.setProperty(PROP_KEYS.ACCESS_TOKEN_EXPIRES_AT, String(nowSec + Number(data.expires_in || 0)));
+
+  return data.access_token;
+}
+
+function buildAmoUrl_(path, queryParams) {
+  const props = PropertiesService.getScriptProperties();
+  const subdomain = props.getProperty(PROP_KEYS.SUBDOMAIN);
+  let url = `https://${subdomain}.amocrm.ru${path}`;
+
+  if (queryParams && Object.keys(queryParams).length) {
+    const qs = Object.keys(queryParams)
+      .map(k => `${encodeURIComponent(k)}=${encodeURIComponent(String(queryParams[k]))}`)
+      .join('&');
+    url += '?' + qs;
+  }
+  return url;
+}
